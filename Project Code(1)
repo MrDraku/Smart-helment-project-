@@ -1,0 +1,1090 @@
+
+
+cd ~/projects  # or your preferred directory
+git clone https://github.com/MrDraku/smarthelmet-app.git
+cd smarthelmet-app
+# Create main directory structure
+mkdir -p lib/screens lib/services lib/models
+mkdir -p android/app/src/main/kotlin/com/smarthelmet
+mkdir -p assets/sounds
+
+lib/main.dart
+
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'screens/home_screen.dart';
+import 'services/bluetooth_service.dart';
+import 'services/notification_service.dart';
+import 'services/database_service.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Initialize services
+  await DatabaseService.instance.initDb();
+  await NotificationService.initialize();
+  
+  runApp(const SmartHelmetApp());
+}
+
+class SmartHelmetApp extends StatelessWidget {
+  const SmartHelmetApp({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => BluetoothService()),
+        ChangeNotifierProvider(create: (_) => NotificationService()),
+      ],
+      child: MaterialApp(
+        title: 'SmartHelmet',
+        theme: ThemeData(
+          primarySwatch: Colors.blue,
+          useMaterial3: true,
+          brightness: Brightness.light,
+        ),
+        darkTheme: ThemeData(
+          primarySwatch: Colors.blue,
+          useMaterial3: true,
+          brightness: Brightness.dark,
+        ),
+        themeMode: ThemeMode.system,
+        home: const HomeScreen(),
+      ),
+    );
+  }
+}
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import 'dart:async';
+import 'dart:convert';
+import 'database_service.dart';
+import 'notification_service.dart';
+
+class BluetoothService with ChangeNotifier {
+  final FlutterBluetoothSerial _bluetoothSerial = FlutterBluetoothSerial.instance;
+  
+  BluetoothConnection? _connection;
+  bool _isConnected = false;
+  String _deviceName = '';
+  String _deviceAddress = '';
+  
+  // Sensor data
+  double _accelX = 0, _accelY = 0, _accelZ = 0;
+  double _gyroX = 0, _gyroY = 0, _gyroZ = 0;
+  bool _helmetWorn = false;
+  String _lastMessage = '';
+  
+  StreamSubscription? _connectionStateSubscription;
+  StreamSubscription? _receiveDataSubscription;
+
+  // Getters
+  bool get isConnected => _isConnected;
+  String get deviceName => _deviceName;
+  String get deviceAddress => _deviceAddress;
+  double get accelX => _accelX;
+  double get accelY => _accelY;
+  double get accelZ => _accelZ;
+  double get gyroX => _gyroX;
+  double get gyroY => _gyroY;
+  double get gyroZ => _gyroZ;
+  bool get helmetWorn => _helmetWorn;
+  String get lastMessage => _lastMessage;
+
+  // Connect to SmartHelmet
+  Future<bool> connectToDevice(BluetoothDevice device) async {
+    try {
+      _deviceName = device.name ?? 'Unknown';
+      _deviceAddress = device.address;
+
+      _connection = await BluetoothConnection.toAddress(device.address);
+      _isConnected = true;
+      
+      _connectionStateSubscription = _connection!.isConnected.listen((isConnected) {
+        if (!isConnected) {
+          disconnect();
+        }
+      });
+
+      _receiveDataSubscription = _connection!.input!.listen(_handleReceivedData);
+
+      notifyListeners();
+      return true;
+    } catch (e) {
+      if (kDebugMode) print('Connection error: $e');
+      _isConnected = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
+  // Handle incoming data from ESP32
+  void _handleReceivedData(Uint8List data) {
+    String message = String.fromCharCodes(data).trim();
+    _lastMessage = message;
+
+    if (message.contains('TYPE=ACCIDENT')) {
+      _parseAccidentMessage(message);
+    } else if (message.contains('HELMET=')) {
+      _parseSensorData(message);
+    }
+
+    notifyListeners();
+  }
+
+  // Parse accident message
+  void _parseAccidentMessage(String message) async {
+    try {
+      final parts = message.split(';');
+      final Map<String, String> data = {};
+
+      for (var part in parts) {
+        final keyValue = part.split('=');
+        if (keyValue.length == 2) {
+          data[keyValue[0]] = keyValue[1];
+        }
+      }
+
+      String severity = data['SEV'] ?? 'UNKNOWN';
+      _helmetWorn = data['HELMET'] == '1';
+      double ax = double.tryParse(data['AX'] ?? '0') ?? 0;
+      double ay = double.tryParse(data['AY'] ?? '0') ?? 0;
+      double az = double.tryParse(data['AZ'] ?? '0') ?? 0;
+      double gx = double.tryParse(data['GX'] ?? '0') ?? 0;
+      double gy = double.tryParse(data['GY'] ?? '0') ?? 0;
+      double gz = double.tryParse(data['GZ'] ?? '0') ?? 0;
+
+      // Save to database
+      await DatabaseService.instance.insertAccident(
+        severity: severity,
+        helmetWorn: _helmetWorn,
+        accelX: ax,
+        accelY: ay,
+        accelZ: az,
+        gyroX: gx,
+        gyroY: gy,
+        gyroZ: gz,
+        latitude: 0,
+        longitude: 0,
+      );
+
+      // Send notification
+      await NotificationService.showAccidentAlert(severity, _helmetWorn);
+
+      notifyListeners();
+    } catch (e) {
+      if (kDebugMode) print('Parse accident error: $e');
+    }
+  }
+
+  // Parse sensor data
+  void _parseSensorData(String message) {
+    try {
+      final parts = message.split(';');
+      final Map<String, String> data = {};
+
+      for (var part in parts) {
+        final keyValue = part.split('=');
+        if (keyValue.length == 2) {
+          data[keyValue[0]] = keyValue[1];
+        }
+      }
+
+      _accelX = double.tryParse(data['AX'] ?? '0') ?? 0;
+      _accelY = double.tryParse(data['AY'] ?? '0') ?? 0;
+      _accelZ = double.tryParse(data['AZ'] ?? '0') ?? 0;
+      _gyroX = double.tryParse(data['GX'] ?? '0') ?? 0;
+      _gyroY = double.tryParse(data['GY'] ?? '0') ?? 0;
+      _gyroZ = double.tryParse(data['GZ'] ?? '0') ?? 0;
+      _helmetWorn = data['HELMET'] == '1';
+
+      notifyListeners();
+    } catch (e) {
+      if (kDebugMode) print('Parse sensor error: $e');
+    }
+  }
+
+  // Disconnect
+  Future<void> disconnect() async {
+    await _connectionStateSubscription?.cancel();
+    await _receiveDataSubscription?.cancel();
+    await _connection?.finish();
+    _isConnected = false;
+    notifyListeners();
+  }
+
+  // Send test alert
+  Future<void> sendTestAlert() async {
+    if (_connection != null && _isConnected) {
+      _connection!.output.add(utf8.encode('TEST\n'));
+    }
+  }
+
+  @override
+  void dispose() {
+    disconnect();
+    super.dispose();
+  }
+}
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+class NotificationService with ChangeNotifier {
+  static final FlutterLocalNotificationsPlugin _notificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+
+  static Future<void> initialize() async {
+    const AndroidInitializationSettings androidSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+
+    const DarwinInitializationSettings iosSettings =
+        DarwinInitializationSettings(
+      requestSoundPermission: true,
+      requestBadgePermission: true,
+      requestAlertPermission: true,
+    );
+
+    const InitializationSettings initSettings = InitializationSettings(
+      android: androidSettings,
+      iOS: iosSettings,
+    );
+
+    await _notificationsPlugin.initialize(initSettings);
+  }
+
+  static Future<void> showAccidentAlert(String severity, bool helmetWorn) async {
+    const AndroidNotificationDetails androidDetails =
+        AndroidNotificationDetails(
+      'accident_channel',
+      'Accident Alerts',
+      channelDescription: 'Notifications for detected accidents',
+      importance: Importance.max,
+      priority: Priority.high,
+      enableVibration: true,
+      playSound: true,
+    );
+
+    const DarwinNotificationDetails iosDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    const NotificationDetails details = NotificationDetails(
+      android: androidDetails,
+      iOS: iosDetails,
+    );
+
+    String title = 'ACCIDENT DETECTED!';
+    String body = 'Severity: $severity | Helmet: ${helmetWorn ? "YES" : "NO"}';
+
+    await _notificationsPlugin.show(
+      0,
+      title,
+      body,
+      details,
+    );
+  }
+}
+
+class AccidentModel {
+  final int id;
+  final String severity;
+  final bool helmetWorn;
+  final double accelX;
+  final double accelY;
+  final double accelZ;
+  final double gyroX;
+  final double gyroY;
+  final double gyroZ;
+  final double latitude;
+  final double longitude;
+  final DateTime timestamp;
+
+  AccidentModel({
+    required this.id,
+    required this.severity,
+    required this.helmetWorn,
+    required this.accelX,
+    required this.accelY,
+    required this.accelZ,
+    required this.gyroX,
+    required this.gyroY,
+    required this.gyroZ,
+    required this.latitude,
+    required this.longitude,
+    required this.timestamp,
+  });
+
+  factory AccidentModel.fromMap(Map<String, dynamic> map) {
+    return AccidentModel(
+      id: map['id'],
+      severity: map['severity'],
+      helmetWorn: map['helmetWorn'] == 1,
+      accelX: map['accelX'],
+      accelY: map['accelY'],
+      accelZ: map['accelZ'],
+      gyroX: map['gyroX'],
+      gyroY: map['gyroY'],
+      gyroZ: map['gyroZ'],
+      latitude: map['latitude'],
+      longitude: map['longitude'],
+      timestamp: DateTime.parse(map['timestamp']),
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'severity': severity,
+      'helmetWorn': helmetWorn ? 1 : 0,
+      'accelX': accelX,
+      'accelY': accelY,
+      'accelZ': accelZ,
+      'gyroX': gyroX,
+      'gyroY': gyroY,
+      'gyroZ': gyroZ,
+      'latitude': latitude,
+      'longitude': longitude,
+      'timestamp': timestamp.toIso8601String(),
+    };
+  }
+}
+
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import '../services/bluetooth_service.dart';
+import 'history_screen.dart';
+import 'settings_screen.dart';
+import 'sensor_dashboard.dart';
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({Key? key}) : super(key: key);
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  List<BluetoothDevice> _devices = [];
+  bool _isScanning = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _getAvailableDevices();
+  }
+
+  Future<void> _getAvailableDevices() async {
+    setState(() => _isScanning = true);
+    try {
+      final devices = await FlutterBluetoothSerial.instance.getBondedDevices();
+      setState(() {
+        _devices = devices.toList();
+        _isScanning = false;
+      });
+    } catch (e) {
+      setState(() => _isScanning = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final btService = Provider.of<BluetoothService>(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('SmartHelmet'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const SettingsScreen()),
+            ),
+          ),
+        ],
+      ),
+      body: btService.isConnected
+          ? const SensorDashboard()
+          : Column(
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  color: Colors.blue.shade100,
+                  child: const Text(
+                    'Connect to SmartHelmet_ESP32 to get started',
+                    style: TextStyle(fontSize: 16),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+                Expanded(
+                  child: _isScanning
+                      ? const Center(child: CircularProgressIndicator())
+                      : ListView.builder(
+                          itemCount: _devices.length,
+                          itemBuilder: (context, index) {
+                            final device = _devices[index];
+                            return ListTile(
+                              title: Text(device.name ?? 'Unknown'),
+                              subtitle: Text(device.address),
+                              trailing: const Icon(Icons.bluetooth),
+                              onTap: () async {
+                                final success =
+                                    await btService.connectToDevice(device);
+                                if (success && mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content:
+                                          Text('Connected successfully!'),
+                                    ),
+                                  );
+                                } else if (mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Connection failed'),
+                                    ),
+                                  );
+                                }
+                              },
+                            );
+                          },
+                        ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Scan Devices'),
+                    onPressed: _isScanning ? null : _getAvailableDevices,
+                  ),
+                ),
+              ],
+            ),
+      bottomNavigationBar: BottomNavigationBar(
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.dashboard),
+            label: 'Dashboard',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.history),
+            label: 'History',
+          ),
+        ],
+        onTap: (index) {
+          if (index == 1) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const HistoryScreen()),
+            );
+          }
+        },
+      ),
+    );
+  }
+}
+lib/screens/sensor_dashboard.dart
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../services/bluetooth_service.dart';
+
+class SensorDashboard extends StatefulWidget {
+  const SensorDashboard({Key? key}) : super(key: key);
+
+  @override
+  State<SensorDashboard> createState() => _SensorDashboardState();
+}
+
+class _SensorDashboardState extends State<SensorDashboard> {
+  @override
+  Widget build(BuildContext context) {
+    final btService = Provider.of<BluetoothService>(context);
+
+    return SingleChildScrollView(
+      child: Column(
+        children: [
+          // Connection Status
+          Container(
+            padding: const EdgeInsets.all(16),
+            color: btService.isConnected ? Colors.green.shade100 : Colors.red.shade100,
+            child: Row(
+              children: [
+                Icon(
+                  btService.isConnected ? Icons.check_circle : Icons.cancel,
+                  color: btService.isConnected ? Colors.green : Colors.red,
+                  size: 32,
+                ),
+                const SizedBox(width: 16),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      btService.isConnected ? 'Connected' : 'Disconnected',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(btService.deviceName),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          // Helmet Status
+          Container(
+            margin: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              color: btService.helmetWorn ? Colors.green.shade50 : Colors.orange.shade50,
+              border: Border.all(
+                color: btService.helmetWorn ? Colors.green : Colors.orange,
+                width: 2,
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.safety_check,
+                  color: btService.helmetWorn ? Colors.green : Colors.orange,
+                  size: 40,
+                ),
+                const SizedBox(width: 16),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Helmet Status'),
+                    Text(
+                      btService.helmetWorn ? 'WORN' : 'NOT WORN',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: btService.helmetWorn ? Colors.green : Colors.orange,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          // Sensor Readings
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Real-Time Sensor Data',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 16),
+                    _buildSensorRow('Accel X (g)', btService.accelX),
+                    _buildSensorRow('Accel Y (g)', btService.accelY),
+                    _buildSensorRow('Accel Z (g)', btService.accelZ),
+                    const SizedBox(height: 16),
+                    _buildSensorRow('Gyro X (°/s)', btService.gyroX),
+                    _buildSensorRow('Gyro Y (°/s)', btService.gyroY),
+                    _buildSensorRow('Gyro Z (°/s)', btService.gyroZ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // Test Button
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.warning),
+              label: const Text('Send Test Alert'),
+              onPressed: () async {
+                await btService.sendTestAlert();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Test alert sent')),
+                );
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orange,
+                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSensorRow(String label, double value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label),
+          Text(
+            value.toStringAsFixed(2),
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+import 'package:flutter/material.dart';
+import '../services/database_service.dart';
+import '../models/accident_model.dart';
+
+class HistoryScreen extends StatefulWidget {
+  const HistoryScreen({Key? key}) : super(key: key);
+
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  late Future<List<AccidentModel>> _accidentsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _accidentsFuture = DatabaseService.instance.getAllAccidents();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Accident History')),
+      body: FutureBuilder<List<AccidentModel>>(
+        future: _accidentsFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          if (!snapshot.hasData || snapshot.data!.isEmpty) {
+            return const Center(
+              child: Text('No accidents recorded yet'),
+            );
+          }
+
+          final accidents = snapshot.data!;
+
+          return ListView.builder(
+            itemCount: accidents.length,
+            itemBuilder: (context, index) {
+              final accident = accidents[index];
+              final color = accident.severity == 'HIGH'
+                  ? Colors.red
+                  : accident.severity == 'MED'
+                      ? Colors.orange
+                      : Colors.yellow;
+
+              return Card(
+                margin: const EdgeInsets.all(8),
+                child: ListTile(
+                  leading: CircleAvatar(
+                    backgroundColor: color,
+                    child: const Icon(Icons.warning, color: Colors.white),
+                  ),
+                  title: Text('${accident.severity} Severity'),
+                  subtitle: Text(
+                    '${accident.timestamp.toString().split('.')[0]}\n'
+                    'Helmet: ${accident.helmetWorn ? "YES" : "NO"}\n'
+                    'Accel: ${accident.accelX.toStringAsFixed(2)}g',
+                  ),
+                  isThreeLine: true,
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete),
+                    onPressed: () async {
+                      await DatabaseService.instance.deleteAccident(accident.id);
+                      setState(() {
+                        _accidentsFuture = DatabaseService.instance.getAllAccidents();
+                      });
+                    },
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../services/bluetooth_service.dart';
+
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({Key? key}) : super(key: key);
+
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  String _emergencyContact1 = '';
+  String _emergencyContact2 = '';
+  bool _enableAutoSMS = false;
+  bool _enableGPS = true;
+
+  @override
+  Widget build(BuildContext context) {
+    final btService = Provider.of<BluetoothService>(context);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          // Connection Settings
+          const Text(
+            'Bluetooth',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            title: const Text('Current Device'),
+            subtitle: Text(btService.isConnected ? btService.deviceName : 'Not Connected'),
+            trailing: btService.isConnected
+                ? ElevatedButton(
+                    onPressed: () async {
+                      await btService.disconnect();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Disconnected')),
+                      );
+                    },
+                    child: const Text('Disconnect'),
+                  )
+                : null,
+          ),
+          const Divider(),
+
+          // Emergency Contacts
+          const Text(
+            'Emergency Contacts',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            decoration: const InputDecoration(
+              labelText: 'Contact 1 (Phone Number)',
+              hintText: '+1234567890',
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (value) => setState(() => _emergencyContact1 = value),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            decoration: const InputDecoration(
+              labelText: 'Contact 2 (Phone Number)',
+              hintText: '+1234567890',
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (value) => setState(() => _emergencyContact2 = value),
+          ),
+          const Divider(),
+
+          // Notification Settings
+          const Text(
+            'Notifications',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          SwitchListTile(
+            title: const Text('Auto SMS on Accident'),
+            subtitle: const Text('Send emergency SMS automatically'),
+            value: _enableAutoSMS,
+            onChanged: (value) => setState(() => _enableAutoSMS = value),
+          ),
+          SwitchListTile(
+            title: const Text('GPS Tracking'),
+            subtitle: const Text('Record location with accidents'),
+            value: _enableGPS,
+            onChanged: (value) => setState(() => _enableGPS = value),
+          ),
+          const Divider(),
+
+          // Save Settings
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 16),
+            child: ElevatedButton(
+              onPressed: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Settings saved')),
+                );
+              },
+              child: const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('Save Settings'),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+
+name: smarthelmet_app
+description: SmartHelmet safety app for ESP32 helmet with Bluetooth.
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.0.0
+  flutter_bluetooth_serial: ^0.4.0
+  sqflite: ^2.2.0
+  path: ^1.8.0
+  flutter_local_notifications: ^14.0.0
+  geolocator: ^9.0.0
+  permission_handler: ^11.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  uses-material-design: true
+
+STEP 6: Create Kotlin Background Service
+Create file: android/app/src/main/kotlin/com/smarthelmet/BackgroundBluetoothService.kt
+
+package com.smarthelmet
+
+import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothSocket
+import android.content.Intent
+import android.os.Binder
+import android.os.IBinder
+import android.util.Log
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.*
+
+class BackgroundBluetoothService : Service() {
+    private val binder = LocalBinder()
+    private var bluetoothSocket: BluetoothSocket? = null
+    private var inputStream: InputStream? = null
+    private var outputStream: OutputStream? = null
+    private var isConnected = false
+    private var receiveThread: Thread? = null
+
+    inner class LocalBinder : Binder() {
+        fun getService(): BackgroundBluetoothService = this@BackgroundBluetoothService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    fun connectToDevice(deviceAddress: String): Boolean {
+        return try {
+            val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+            val device = bluetoothAdapter?.getRemoteDevice(deviceAddress)
+            bluetoothSocket = device?.createRfcommSocketToServiceRecord(
+                UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+            )
+            bluetoothSocket?.connect()
+            inputStream = bluetoothSocket?.inputStream
+            outputStream = bluetoothSocket?.outputStream
+            isConnected = true
+            startReceivingData()
+            Log.d("BT_SERVICE", "Connected to $deviceAddress")
+            true
+        } catch (e: Exception) {
+            Log.e("BT_SERVICE", "Connection failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun startReceivingData() {
+        receiveThread = Thread {
+            val buffer = ByteArray(1024)
+            while (isConnected) {
+                try {
+                    val bytes = inputStream?.read(buffer) ?: 0
+                    if (bytes > 0) {
+                        val data = String(buffer, 0, bytes)
+                        handleReceivedData(data)
+                    }
+                } catch (e: Exception) {
+                    Log.e("BT_SERVICE", "Read error: ${e.message}")
+                    isConnected = false
+                }
+            }
+        }
+        receiveThread?.start()
+    }
+
+    private fun handleReceivedData(data: String) {
+        if (data.contains("TYPE=ACCIDENT")) {
+            Log.d("BT_SERVICE", "Accident detected: $data")
+        }
+    }
+
+    fun disconnect() {
+        isConnected = false
+        receiveThread?.join(1000)
+        inputStream?.close()
+        outputStream?.close()
+        bluetoothSocket?.close()
+    }
+
+    override fun onDestroy() {
+        disconnect()
+        super.onDestroy()
+    }
+}
+
+Update android/app/src/main/AndroidManifest.xml:
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.smarthelmet.smarthelmet_app">
+
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:label="SmartHelmet"
+        android:icon="@mipmap/ic_launcher">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="com.smarthelmet.BackgroundBluetoothService"
+            android:exported="false" />
+
+    </application>
+</manifest>
+# Dart/Flutter/Hive
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+
+# iOS/macOS
+**/ios/**/*.mode1v3
+**/ios/**/*.mode2v3
+**/ios/**/*.moved-aside
+**/ios/**/*.pbxuser
+**/ios/**/*.perspectivev3
+**/ios/**/*sync/
+**/ios/**/.sconsign.dblite
+**/ios/**/.tags*
+**/ios/**/.vagrant/
+**/ios/**/DerivedData/
+**/ios/**/Icon?
+**/ios/**/Icon??
+**/ios/**/Icon???
+**/ios/**/Icon????
+**/ios/**/Icon?????
+**/ios/**/.idea/
+**/ios/**/*.hmap
+**/ios/**/*.ipa
+**/ios/**/.git/
+**/ios/**/.gitignore
+**/ios/**/.gitmodules
+**/ios/**/.gitattributes
+**/ios/**/*.db
+**/ios/**/Flutter/Flutter.podspec
+**/ios/**/Flutter/Flutter.framework
+**/ios/**/Flutter/Flutter.modulemap
+**/ios/**/Flutter/GeneratedPluginRegistrant.*
+**/ios/**/GeneratedPluginRegistrant.*
+
+# Android/Gradle
+**/android/**/gradle-wrapper.jar
+**/android/.gradle
+**/android/captures/
+**/android/gradlew
+**/android/gradlew.bat
+**/android/local.properties
+**/android/**/GeneratedPluginRegistrant.java
+**/android/key.properties
+*.jks
+*.keystore
+
+# Misc
+*.swp
+*~.nib
+.DS_Store
+.dart_tool
+.flutter-plugins*
+analysis_error.txt
+
+# Build results
+*.apk
+*.ipa
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# Output of the go coverage tool
+*.out
+
+
+
+
+
+
+
+
+
+
